@@ -1,12 +1,9 @@
 use embedded_graphics_core::pixelcolor::Rgb565;
-use embedded_hal::delay::DelayNs;
 
 use crate::{
     dcs::SetAddressMode,
-    interface::{Interface, InterfaceKind},
     models::{Model, ModelInitError},
     options::ModelOptions,
-    ConfigurationError,
 };
 
 use super::InitEngine;
