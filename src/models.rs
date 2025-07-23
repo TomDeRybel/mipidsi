@@ -1,9 +1,13 @@
 //! Display models.
 
 use crate::{
-    dcs::SetAddressMode, init_engine::InitEngine, options::ModelOptions, ConfigurationError,
+    dcs::{self, SetAddressMode},
+    init_engine::InitEngine,
+    options::{self, ModelOptions, Rotation},
+    ConfigurationError,
 };
 use embedded_graphics_core::prelude::RgbColor;
+use embedded_hal::delay::DelayNs;
 
 // existing model implementations
 // mod gc9107;
@@ -17,7 +21,7 @@ use embedded_graphics_core::prelude::RgbColor;
 // mod rm67162;
 // mod st7735s;
 mod st7789;
-// mod st7796;
+mod st7796;
 
 // pub use gc9107::*;
 // pub use gc9a01::*;
@@ -28,7 +32,7 @@ mod st7789;
 // pub use rm67162::*;
 // pub use st7735s::*;
 pub use st7789::*;
-// pub use st7796::*;
+pub use st7796::*;
 
 /// Display model.
 pub trait Model {
@@ -52,88 +56,88 @@ pub trait Model {
         IE: InitEngine;
 
     /// Updates the address window of the display.
-    fn update_address_window<DI>(
-        di: &mut DI,
+    fn update_address_window<IE>(
+        ie: &mut IE,
         _rotation: Rotation,
         sx: u16,
         sy: u16,
         ex: u16,
         ey: u16,
-    ) -> Result<(), DI::Error>
+    ) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
-        di.write_command(dcs::SetColumnAddress::new(sx, ex))?;
-        di.write_command(dcs::SetPageAddress::new(sy, ey))
+        ie.queue_command(dcs::SetColumnAddress::new(sx, ex))?;
+        ie.queue_command(dcs::SetPageAddress::new(sy, ey))
     }
 
     ///
     /// Need to call [Self::wake] before issuing other commands
     ///
-    fn sleep<DI, DELAY>(di: &mut DI, delay: &mut DELAY) -> Result<(), DI::Error>
+    fn sleep<IE, DELAY>(ie: &mut IE, _delay: &mut DELAY) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
         DELAY: DelayNs,
     {
-        di.write_command(dcs::EnterSleepMode)?;
+        ie.queue_command(dcs::EnterSleepMode)?;
         // All supported models requires a 120ms delay before issuing other commands
-        delay.delay_us(120_000);
+        ie.queue_delay_us(120_000)?;
         Ok(())
     }
     ///
     /// Wakes the display after it's been set to sleep via [Self::sleep]
     ///
-    fn wake<DI, DELAY>(di: &mut DI, delay: &mut DELAY) -> Result<(), DI::Error>
+    fn wake<IE, DELAY>(ie: &mut IE, _delay: &mut DELAY) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
         DELAY: DelayNs,
     {
-        di.write_command(dcs::ExitSleepMode)?;
+        ie.queue_command(dcs::ExitSleepMode)?;
         // ST7789 and st7735s have the highest minimal delay of 120ms
-        delay.delay_us(120_000);
+        ie.queue_delay_us(120_000)?;
         Ok(())
     }
     ///
-    /// We need WriteMemoryStart befor write pixel
+    /// We need WriteMemoryStart before write pixel
     ///
-    fn write_memory_start<DI>(di: &mut DI) -> Result<(), DI::Error>
+    fn write_memory_start<IE>(ie: &mut IE) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
-        di.write_command(dcs::WriteMemoryStart)
+        ie.queue_command(dcs::WriteMemoryStart)
     }
     ///
     /// SoftReset
     ///
-    fn software_reset<DI>(di: &mut DI) -> Result<(), DI::Error>
+    fn software_reset<IE>(ie: &mut IE) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
-        di.write_command(dcs::SoftReset)
+        ie.queue_command(dcs::SoftReset)
     }
     ///
     /// This function will been called if user update options
     ///
-    fn update_options<DI>(&self, di: &mut DI, options: &ModelOptions) -> Result<(), DI::Error>
+    fn update_options<IE>(&self, ie: &mut IE, options: &ModelOptions) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
         let madctl = SetAddressMode::from(options);
-        di.write_command(madctl)
+        ie.queue_command(madctl)
     }
 
     ///
     /// Configures the tearing effect output.
     ///
-    fn set_tearing_effect<DI>(
-        di: &mut DI,
+    fn set_tearing_effect<IE>(
+        ie: &mut IE,
         tearing_effect: options::TearingEffect,
         _options: &ModelOptions,
-    ) -> Result<(), DI::Error>
+    ) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
-        di.write_command(dcs::SetTearingEffect::new(tearing_effect))
+        ie.queue_command(dcs::SetTearingEffect::new(tearing_effect))
     }
 
     /// Sets the vertical scroll region.
@@ -151,13 +155,13 @@ pub trait Model {
     ///
     /// After the scrolling region is defined the [`set_vertical_scroll_offset`](Self::set_vertical_scroll_offset) can be
     /// used to scroll the display.
-    fn set_vertical_scroll_region<DI>(
-        di: &mut DI,
+    fn set_vertical_scroll_region<IE>(
+        ie: &mut IE,
         top_fixed_area: u16,
         bottom_fixed_area: u16,
-    ) -> Result<(), DI::Error>
+    ) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
         let rows = Self::FRAMEBUFFER_SIZE.1;
 
@@ -171,7 +175,7 @@ pub trait Model {
             )
         };
 
-        di.write_command(vscrdef)
+        ie.queue_command(vscrdef)
     }
 
     /// Sets the vertical scroll offset.
@@ -181,12 +185,12 @@ pub trait Model {
     ///
     /// Use [`set_vertical_scroll_region`](Self::set_vertical_scroll_region) to setup the scroll region, before
     /// using this method.
-    fn set_vertical_scroll_offset<DI>(di: &mut DI, offset: u16) -> Result<(), DI::Error>
+    fn set_vertical_scroll_offset<IE>(ie: &mut IE, offset: u16) -> Result<(), IE::Error>
     where
-        DI: Interface,
+        IE: InitEngine,
     {
         let vscad = dcs::SetScrollStart::new(offset);
-        di.write_command(vscad)
+        ie.queue_command(vscad)
     }
 }
 
@@ -199,7 +203,7 @@ pub enum ModelInitError<DiError> {
     /// Error caused by the display interface.
     Interface(DiError),
 
-    /// The init enine's queue, used for this Model's init, was too small
+    /// The init engine's queue, used for this Model's init, was too small
     InitEngineQueueFull,
 
     /// Invalid configuration error.
