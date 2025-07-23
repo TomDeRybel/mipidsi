@@ -106,8 +106,6 @@
 //! display.clear(Rgb666::RED).unwrap();
 //! ```
 
-use dcs::SetAddressMode;
-
 pub mod interface;
 
 use embedded_hal::delay::DelayNs;
@@ -123,6 +121,7 @@ mod builder;
 pub use builder::*;
 
 pub mod dcs;
+use dcs::SetAddressMode;
 
 pub mod models;
 use models::Model;
@@ -191,8 +190,10 @@ where
     /// display.set_orientation(Orientation::default().rotate(Rotation::Deg180)).unwrap();
     /// ```
     pub fn set_orientation(&mut self, orientation: options::Orientation) -> Result<(), DI::Error> {
-        self.options.orientation = orientation;
-        self.model.update_options(&mut self.di, &self.options)
+        self.madctl = self.madctl.with_orientation(orientation); // set orientation
+        self.di.write_command(self.madctl)?;
+
+        Ok(())
     }
 
     ///
@@ -256,7 +257,7 @@ where
     {
         self.set_address_window(sx, sy, ex, ey)?;
 
-        M::write_memory_start(&mut self.di)?;
+        self.di.write_command(dcs::WriteMemoryStart)?;
 
         M::ColorFormat::send_pixels(&mut self.di, colors)
     }
@@ -281,7 +282,19 @@ where
         top_fixed_area: u16,
         bottom_fixed_area: u16,
     ) -> Result<(), DI::Error> {
-        M::set_vertical_scroll_region(&mut self.di, top_fixed_area, bottom_fixed_area)
+        let rows = M::FRAMEBUFFER_SIZE.1;
+
+        let vscrdef = if top_fixed_area + bottom_fixed_area > rows {
+            dcs::SetScrollArea::new(rows, 0, 0)
+        } else {
+            dcs::SetScrollArea::new(
+                top_fixed_area,
+                rows - top_fixed_area - bottom_fixed_area,
+                bottom_fixed_area,
+            )
+        };
+
+        self.di.write_command(vscrdef)
     }
 
     /// Sets the vertical scroll offset.
@@ -292,7 +305,8 @@ where
     /// Use [`set_vertical_scroll_region`](Self::set_vertical_scroll_region) to setup the scroll region, before
     /// using this method.
     pub fn set_vertical_scroll_offset(&mut self, offset: u16) -> Result<(), DI::Error> {
-        M::set_vertical_scroll_offset(&mut self.di, offset)
+        let vscad = dcs::SetScrollStart::new(offset);
+        self.di.write_command(vscad)
     }
 
     ///
@@ -320,14 +334,8 @@ where
 
         let (sx, sy, ex, ey) = (sx + offset.0, sy + offset.1, ex + offset.0, ey + offset.1);
 
-        M::update_address_window(
-            &mut self.di,
-            self.options.orientation.rotation,
-            sx,
-            sy,
-            ex,
-            ey,
-        )
+        self.di.write_command(dcs::SetColumnAddress::new(sx, ex))?;
+        self.di.write_command(dcs::SetPageAddress::new(sy, ey))
     }
 
     ///
@@ -337,7 +345,8 @@ where
         &mut self,
         tearing_effect: options::TearingEffect,
     ) -> Result<(), DI::Error> {
-        M::set_tearing_effect(&mut self.di, tearing_effect, &self.options)
+        self.di
+            .write_command(dcs::SetTearingEffect::new(tearing_effect))
     }
 
     ///
@@ -352,7 +361,9 @@ where
     /// Need to call [Self::wake] before issuing other commands
     ///
     pub fn sleep<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), DI::Error> {
-        M::sleep(&mut self.di, delay)?;
+        self.di.write_command(dcs::EnterSleepMode)?;
+        // All supported models requires a 120ms delay before issuing other commands
+        delay.delay_us(120_000);
         self.sleeping = true;
         Ok(())
     }
@@ -361,7 +372,9 @@ where
     /// Wakes the display after it's been set to sleep via [Self::sleep]
     ///
     pub fn wake<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), DI::Error> {
-        M::wake(&mut self.di, delay)?;
+        self.di.write_command(dcs::ExitSleepMode)?;
+        // ST7789 and st7735s have the highest minimal delay of 120ms
+        delay.delay_us(120_000);
         self.sleeping = false;
         Ok(())
     }
