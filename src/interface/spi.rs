@@ -15,7 +15,7 @@ pub enum SpiError<SPI, DC> {
 /// Spi interface, including a buffer
 ///
 /// The buffer is used to gather batches of pixel data to be sent over SPI.
-/// Larger buffers will genererally be faster (with diminishing returns), at the expense of using more RAM.
+/// Larger buffers will generally be faster (with diminishing returns), at the expense of using more RAM.
 /// The buffer should be at least big enough to hold a few pixels of data.
 ///
 /// You may want to use [static_cell](https://crates.io/crates/static_cell)

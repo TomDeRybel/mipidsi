@@ -132,7 +132,7 @@ where
         Ok(())
     }
 
-    // Sets the addre
+    // Sets the address
     fn store_address_window(&mut self, sx: u16, sy: u16, ex: u16, ey: u16) {
         self.last_window_extents.x = (sx, ex);
         self.last_window_extents.y = (sy, ey);
