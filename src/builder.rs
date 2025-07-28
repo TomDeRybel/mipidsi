@@ -9,11 +9,16 @@ use embedded_hal_async::delay::DelayNs as AsyncDelayNs;
 
 use crate::{
     framebuffer::WindowExtents,
-    init_engine::{InitEngine, InitEngineAsync, InitEngineSync, QueuedInitCommand},
-    interface::{Interface, InterfaceAsync, InterfacePixelFormat},
+    init_engine::{
+        InitEngine, InitEngineAsync, InitEngineItrAsync, InitEngineSync, QueuedInitCommand,
+    },
+    interface::{
+        Interface, InterfaceAsync, InterfaceItrAsync, InterfacePixelFormat,
+        InterfacePixelFormatItrAsync,
+    },
     models::{Model, ModelInitError},
     options::{ColorInversion, ColorOrder, ModelOptions, Orientation, RefreshOrder},
-    Display, DisplayAsync,
+    Display, DisplayAsync, DisplayItrAsync,
 };
 
 /// Builder for [Display] instances.
@@ -52,6 +57,26 @@ where
     ///
     #[must_use]
     pub fn new(model: MODEL, di: DI) -> Self {
+        Self {
+            di,
+            model,
+            rst: None,
+            options: ModelOptions::full_size::<MODEL>(),
+        }
+    }
+}
+
+impl<DI, MODEL> Builder<DI, MODEL, NoResetPin>
+where
+    DI: InterfaceItrAsync,
+    MODEL: Model,
+    MODEL::ColorFormat: InterfacePixelFormatItrAsync<DI::Word>,
+{
+    ///
+    /// Constructs a new builder for given [Model].
+    ///
+    #[must_use]
+    pub fn new_itr_async(model: MODEL, di: DI) -> Self {
         Self {
             di,
             model,
@@ -219,6 +244,89 @@ where
 
         let display = Display {
             di: ie.release(),
+            model: self.model,
+            rst: self.rst,
+            options: self.options,
+            madctl,
+            sleeping: false, // TODO: init should lock state
+        };
+
+        Ok(display)
+    }
+}
+
+impl<DI, MODEL, RST> Builder<DI, MODEL, RST>
+where
+    DI: InterfaceItrAsync,
+    MODEL: Model,
+    MODEL::ColorFormat: InterfacePixelFormatItrAsync<DI::Word>,
+    RST: OutputPin,
+{
+    ///
+    /// Consumes the builder to create a new [Display] with an optional reset [OutputPin].
+    /// Blocks using the provided [DelayNs] `delay_source` to perform the display initialization.
+    /// The display will be awake ready to use, no need to call [Display::wake] after init.
+    ///
+    /// Returns [InitError] if the area defined by the [`display_size`](Self::display_size)
+    /// and [`display_offset`](Self::display_offset) settings is (partially) outside the framebuffer.
+    pub async fn init_itr_async(
+        mut self,
+        delay_source: &mut impl AsyncDelayNs,
+    ) -> Result<DisplayItrAsync<DI, MODEL, RST>, InitError<DI::Error, RST::Error>> {
+        let to_u32 = |(a, b)| (u32::from(a), u32::from(b));
+        let (width, height) = to_u32(self.options.display_size);
+        let (offset_x, offset_y) = to_u32(self.options.display_offset);
+        let (max_width, max_height) = to_u32(MODEL::FRAMEBUFFER_SIZE);
+
+        if width == 0 || height == 0 || width > max_width || height > max_height {
+            return Err(InitError::InvalidConfiguration(
+                ConfigurationError::InvalidDisplaySize,
+            ));
+        }
+
+        if width + offset_x > max_width {
+            return Err(InitError::InvalidConfiguration(
+                ConfigurationError::InvalidDisplayOffset,
+            ));
+        }
+
+        if height + offset_y > max_height {
+            return Err(InitError::InvalidConfiguration(
+                ConfigurationError::InvalidDisplayOffset,
+            ));
+        }
+
+        match self.rst {
+            Some(ref mut rst) => {
+                rst.set_low().map_err(InitError::ResetPin)?;
+                delay_source.delay_us(MODEL::RESET_DURATION).await;
+                rst.set_high().map_err(InitError::ResetPin)?;
+            }
+            None => self
+                .di
+                .write_command(crate::dcs::SoftReset)
+                .await
+                .map_err(InitError::Interface)?,
+        }
+
+        let mut ie = InitEngineItrAsync::new(&self.di);
+        let madctl = self.model.init(&self.options, &mut ie).unwrap(); // TODO: unify errors
+
+        while let Some(command) = ie.pop_command() {
+            match command {
+                QueuedInitCommand::Delay(us) => delay_source.delay_us(us).await,
+                QueuedInitCommand::RawDcs(cmd, args) => self
+                    .di
+                    .send_command(cmd, args.as_slice())
+                    .await
+                    .map_err(InitError::Interface)?,
+            }
+        }
+
+        // TODO: Validate if this is this right? Using the render engine queuing,
+        //       as in DisplayAsync, below.
+        let display = DisplayItrAsync {
+            di: self.di, //ie.release(),
             model: self.model,
             rst: self.rst,
             options: self.options,

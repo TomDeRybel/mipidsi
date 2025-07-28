@@ -12,13 +12,20 @@ documentation = "https://docs.rs/mipidsi"
 rust-version = "1.75"
 
 [dependencies]
-embedded-graphics-core = "0.4.0"
+#embedded-graphics-core = "0.4.0"
+embedded-graphics-core = { path = "../embedded-graphics/core", features = [
+    "async_draw",
+] }
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
 heapless = "0.8.0"
 
 [dev-dependencies]
-embedded-graphics = "0.8.1"
+#embedded-graphics = "0.8.1"
+#embedded-graphics = { path = "../embedded-graphics", features = ["async_draw"] }
+embedded-graphics = { git = "https://github.com/TomDeRybel/embedded-graphics.git", features = [
+    "async_draw",
+] }
 
 [features]
 default = ["batch"]

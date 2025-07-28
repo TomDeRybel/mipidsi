@@ -1,0 +1,422 @@
+use embedded_hal::digital::OutputPin;
+use embedded_hal_async::delay::DelayNs;
+
+use embedded_graphics_core::{
+    draw_target::AsyncDrawTarget,
+    prelude::{Dimensions, OriginDimensions, Size},
+    primitives::Rectangle,
+    Pixel,
+};
+
+use crate::{
+    dcs,
+    graphics::{nth_u32, take_u32, TakeSkip},
+    interface::{InterfaceItrAsync, InterfacePixelFormatItrAsync},
+    models::Model,
+    options, MemoryMapping,
+};
+
+///
+/// Iterator-based Async display driver to connect to TFT displays.
+///
+/// This should eventually be merged into Display (in lib.rs), using something
+/// like: "maybe_async" or "bisync". It's basically the same code, just with
+/// added await().
+///
+pub struct DisplayItrAsync<DI, MODEL, RST>
+where
+    DI: InterfaceItrAsync,
+    MODEL: Model,
+    MODEL::ColorFormat: InterfacePixelFormatItrAsync<DI::Word>,
+    RST: OutputPin,
+{
+    // DCS provider
+    pub(crate) di: DI,
+    // Model
+    pub(crate) model: MODEL,
+    // Reset pin
+    pub(crate) rst: Option<RST>,
+    // Model Options, includes current orientation
+    pub(crate) options: options::ModelOptions,
+    // Current MADCTL value copy for runtime updates
+    pub(crate) madctl: dcs::SetAddressMode,
+    // State monitor for sleeping TODO: refactor to a Model-connected state machine
+    pub(crate) sleeping: bool,
+}
+
+impl<DI, M, RST> DisplayItrAsync<DI, M, RST>
+where
+    DI: InterfaceItrAsync,
+    M: Model,
+    M::ColorFormat: InterfacePixelFormatItrAsync<DI::Word>,
+    RST: OutputPin,
+{
+    ///
+    /// Returns currently set [options::Orientation]
+    ///
+    pub fn orientation(&self) -> options::Orientation {
+        self.options.orientation
+    }
+
+    ///
+    /// Sets display [options::Orientation] with mirror image parameter
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mipidsi::options::{Orientation, Rotation};
+    ///
+    /// # let mut display = mipidsi::_mock::new_mock_display();
+    /// display.set_orientation(Orientation::default().rotate(Rotation::Deg180)).unwrap();
+    /// ```
+    pub async fn set_orientation(
+        &mut self,
+        orientation: options::Orientation,
+    ) -> Result<(), DI::Error> {
+        self.madctl = self.madctl.with_orientation(orientation); // set orientation
+        self.di.write_command(self.madctl).await?;
+
+        Ok(())
+    }
+
+    ///
+    /// Sets a pixel color at the given coords.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - x coordinate
+    /// * `y` - y coordinate
+    /// * `color` - the color value in pixel format of the display [Model]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use embedded_graphics::pixelcolor::Rgb565;
+    ///
+    /// # let mut display = mipidsi::_mock::new_mock_display();
+    /// display.set_pixel(100, 200, Rgb565::new(251, 188, 20)).unwrap();
+    /// ```
+    pub async fn set_pixel(
+        &mut self,
+        x: u16,
+        y: u16,
+        color: M::ColorFormat,
+    ) -> Result<(), DI::Error> {
+        self.set_pixels(x, y, x, y, core::iter::once(color)).await
+    }
+
+    ///
+    /// Sets pixel colors in a rectangular region.
+    ///
+    /// The color values from the `colors` iterator will be drawn to the given region starting
+    /// at the top left corner and continuing, row first, to the bottom right corner. No bounds
+    /// checking is performed on the `colors` iterator and drawing will wrap around if the
+    /// iterator returns more color values than the number of pixels in the given region.
+    ///
+    /// This is a low level function, which isn't intended to be used in regular user code.
+    /// Consider using the [`fill_contiguous`](https://docs.rs/embedded-graphics/latest/embedded_graphics/draw_target/trait.DrawTarget.html#method.fill_contiguous)
+    /// function from the `embedded-graphics` crate as an alternative instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `sx` - x coordinate start
+    /// * `sy` - y coordinate start
+    /// * `ex` - x coordinate end
+    /// * `ey` - y coordinate end
+    /// * `colors` - anything that can provide `IntoIterator<Item = u16>` to iterate over pixel data
+    /// <div class="warning">
+    ///
+    /// The end values of the X and Y coordinate ranges are inclusive, and no
+    /// bounds checking is performed on these values. Using out of range values
+    /// (e.g., passing `320` instead of `319` for a 320 pixel wide display) will
+    /// result in undefined behavior.
+    ///
+    /// </div>
+    pub async fn set_pixels<T>(
+        &mut self,
+        sx: u16,
+        sy: u16,
+        ex: u16,
+        ey: u16,
+        colors: T,
+    ) -> Result<(), DI::Error>
+    where
+        T: IntoIterator<Item = M::ColorFormat>,
+    {
+        self.set_address_window(sx, sy, ex, ey).await?;
+
+        self.di.write_command(dcs::WriteMemoryStart).await?;
+
+        M::ColorFormat::send_pixels(&mut self.di, colors).await
+    }
+
+    /// Sets the vertical scroll region.
+    ///
+    /// The `top_fixed_area` and `bottom_fixed_area` arguments can be used to
+    /// define an area on the top and/or bottom of the display which won't be
+    /// affected by scrolling.
+    ///
+    /// Note that this method is not affected by the current display orientation
+    /// and will always scroll vertically relative to the default display
+    /// orientation.
+    ///
+    /// The combined height of the fixed area must not larger than the
+    /// height of the framebuffer height in the default orientation.
+    ///
+    /// After the scrolling region is defined the [`set_vertical_scroll_offset`](Self::set_vertical_scroll_offset) can be
+    /// used to scroll the display.
+    pub async fn set_vertical_scroll_region(
+        &mut self,
+        top_fixed_area: u16,
+        bottom_fixed_area: u16,
+    ) -> Result<(), DI::Error> {
+        let rows = M::FRAMEBUFFER_SIZE.1;
+
+        let vscrdef = if top_fixed_area + bottom_fixed_area > rows {
+            dcs::SetScrollArea::new(rows, 0, 0)
+        } else {
+            dcs::SetScrollArea::new(
+                top_fixed_area,
+                rows - top_fixed_area - bottom_fixed_area,
+                bottom_fixed_area,
+            )
+        };
+
+        self.di.write_command(vscrdef).await
+    }
+
+    /// Sets the vertical scroll offset.
+    ///
+    /// Setting the vertical scroll offset shifts the vertical scroll region
+    /// upwards by `offset` pixels.
+    ///
+    /// Use [`set_vertical_scroll_region`](Self::set_vertical_scroll_region) to setup the scroll region, before
+    /// using this method.
+    pub async fn set_vertical_scroll_offset(&mut self, offset: u16) -> Result<(), DI::Error> {
+        let vscad = dcs::SetScrollStart::new(offset);
+        self.di.write_command(vscad).await
+    }
+
+    ///
+    /// Release resources allocated to this driver back.
+    /// This returns the display interface, reset pin and and the model deconstructing the driver.
+    ///
+    pub fn release(self) -> (DI, M, Option<RST>) {
+        (self.di, self.model, self.rst)
+    }
+
+    // Sets the address window for the display.
+    async fn set_address_window(
+        &mut self,
+        sx: u16,
+        sy: u16,
+        ex: u16,
+        ey: u16,
+    ) -> Result<(), DI::Error> {
+        // add clipping offsets if present
+        let mut offset = self.options.display_offset;
+        let mapping = MemoryMapping::from(self.options.orientation);
+        if mapping.reverse_columns {
+            offset.0 = M::FRAMEBUFFER_SIZE.0 - (self.options.display_size.0 + offset.0);
+        }
+        if mapping.reverse_rows {
+            offset.1 = M::FRAMEBUFFER_SIZE.1 - (self.options.display_size.1 + offset.1);
+        }
+        if mapping.swap_rows_and_columns {
+            offset = (offset.1, offset.0);
+        }
+
+        let (sx, sy, ex, ey) = (sx + offset.0, sy + offset.1, ex + offset.0, ey + offset.1);
+
+        self.di
+            .write_command(dcs::SetColumnAddress::new(sx, ex))
+            .await?;
+        self.di
+            .write_command(dcs::SetPageAddress::new(sy, ey))
+            .await
+    }
+
+    ///
+    /// Configures the tearing effect output.
+    ///
+    pub async fn set_tearing_effect(
+        &mut self,
+        tearing_effect: options::TearingEffect,
+    ) -> Result<(), DI::Error> {
+        self.di
+            .write_command(dcs::SetTearingEffect::new(tearing_effect))
+            .await
+    }
+
+    ///
+    /// Returns `true` if display is currently set to sleep.
+    ///
+    pub fn is_sleeping(&self) -> bool {
+        self.sleeping
+    }
+
+    ///
+    /// Puts the display to sleep, reducing power consumption.
+    /// Need to call [Self::wake] before issuing other commands
+    ///
+    pub async fn sleep<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), DI::Error> {
+        self.di.write_command(dcs::EnterSleepMode).await?;
+        // All supported models requires a 120ms delay before issuing other commands
+        delay.delay_us(120_000).await;
+        self.sleeping = true;
+        Ok(())
+    }
+
+    ///
+    /// Wakes the display after it's been set to sleep via [Self::sleep]
+    ///
+    pub async fn wake<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), DI::Error> {
+        self.di.write_command(dcs::ExitSleepMode).await?;
+        // ST7789 and st7735s have the highest minimal delay of 120ms
+        delay.delay_us(120_000).await;
+        self.sleeping = false;
+        Ok(())
+    }
+
+    /// Returns the DCS interface for sending raw commands.
+    ///
+    /// # Safety
+    ///
+    /// Sending raw commands to the controller can lead to undefined behaviour,
+    /// because the rest of the code isn't aware of any state changes that were caused by sending raw commands.
+    /// The user must ensure that the state of the controller isn't altered in a way that interferes with the normal
+    /// operation of this crate.
+    pub unsafe fn dcs(&mut self) -> &mut DI {
+        &mut self.di
+    }
+}
+
+// TODO: have to use the patched embedded-graphics crate with the DrawTargetAsync in it...
+impl<DI, M, RST> AsyncDrawTarget for DisplayItrAsync<DI, M, RST>
+where
+    DI: InterfaceItrAsync,
+    M: Model,
+    M::ColorFormat: InterfacePixelFormatItrAsync<DI::Word>,
+    RST: OutputPin,
+{
+    type Error = DI::Error;
+    type Color = M::ColorFormat;
+
+    #[cfg(not(feature = "batch"))]
+    async fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for pixel in pixels {
+            let x = pixel.0.x as u16;
+            let y = pixel.0.y as u16;
+
+            self.set_pixel(x, y, pixel.1).await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "batch")]
+    async fn draw_iter_async<T>(&mut self, item: T) -> Result<(), Self::Error>
+    where
+        T: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        use crate::batch::DrawBatchItrAsync;
+
+        self.draw_batch(item).await
+    }
+
+    async fn fill_contiguous_async<I>(
+        &mut self,
+        area: &Rectangle,
+        colors: I,
+    ) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        let intersection = area.intersection(&self.bounding_box());
+        let Some(bottom_right) = intersection.bottom_right() else {
+            // No intersection -> nothing to draw
+            return Ok(());
+        };
+
+        // Unchecked casting to u16 cannot fail here because the values are
+        // clamped to the display size which always fits in an u16.
+        let sx = intersection.top_left.x as u16;
+        let sy = intersection.top_left.y as u16;
+        let ex = bottom_right.x as u16;
+        let ey = bottom_right.y as u16;
+
+        let count = intersection.size.width * intersection.size.height;
+
+        let mut colors = colors.into_iter();
+
+        if &intersection == area {
+            // Draw the original iterator if no edge overlaps the framebuffer
+            self.set_pixels(sx, sy, ex, ey, take_u32(colors, count))
+                .await
+        } else {
+            // Skip pixels above and to the left of the intersection
+            let mut initial_skip = 0;
+            if intersection.top_left.y > area.top_left.y {
+                initial_skip += intersection.top_left.y.abs_diff(area.top_left.y) * area.size.width;
+            }
+            if intersection.top_left.x > area.top_left.x {
+                initial_skip += intersection.top_left.x.abs_diff(area.top_left.x);
+            }
+            if initial_skip > 0 {
+                nth_u32(&mut colors, initial_skip - 1);
+            }
+
+            // Draw only the pixels which don't overlap the edges of the framebuffer
+            let take_per_row = intersection.size.width;
+            let skip_per_row = area.size.width - intersection.size.width;
+            self.set_pixels(
+                sx,
+                sy,
+                ex,
+                ey,
+                take_u32(TakeSkip::new(colors, take_per_row, skip_per_row), count),
+            )
+            .await
+        }
+    }
+
+    async fn fill_solid_async(
+        &mut self,
+        area: &Rectangle,
+        color: Self::Color,
+    ) -> Result<(), Self::Error> {
+        let area = area.intersection(&self.bounding_box());
+        let Some(bottom_right) = area.bottom_right() else {
+            // No intersection -> nothing to draw
+            return Ok(());
+        };
+
+        let count = area.size.width * area.size.height;
+
+        let sx = area.top_left.x as u16;
+        let sy = area.top_left.y as u16;
+        let ex = bottom_right.x as u16;
+        let ey = bottom_right.y as u16;
+
+        self.set_address_window(sx, sy, ex, ey).await?;
+        self.di.write_command(dcs::WriteMemoryStart).await?;
+        M::ColorFormat::send_repeated_pixel(&mut self.di, color, count).await
+    }
+}
+
+impl<DI, MODEL, RST> OriginDimensions for DisplayItrAsync<DI, MODEL, RST>
+where
+    DI: InterfaceItrAsync,
+    MODEL: Model,
+    MODEL::ColorFormat: InterfacePixelFormatItrAsync<DI::Word>,
+    RST: OutputPin,
+{
+    fn size(&self) -> Size {
+        let ds = self.options.display_size();
+        let (width, height) = (u32::from(ds.0), u32::from(ds.1));
+        Size::new(width, height)
+    }
+}

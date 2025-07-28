@@ -134,6 +134,9 @@ pub use test_image::TestImage;
 #[cfg(feature = "batch")]
 mod batch;
 
+mod display_itr_async;
+pub use display_itr_async::*;
+
 mod display_async;
 mod framebuffer;
 pub use display_async::*;

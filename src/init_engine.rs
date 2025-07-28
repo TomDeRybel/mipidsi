@@ -4,7 +4,7 @@ use embedded_hal::delay::DelayNs;
 
 use crate::{
     dcs::DcsCommand,
-    interface::{Interface, InterfaceAsync, InterfaceKind},
+    interface::{Interface, InterfaceAsync, InterfaceItrAsync, InterfaceKind},
     models::ModelInitError,
 };
 
@@ -26,6 +26,11 @@ pub trait InitEngine {
 pub struct InitEngineSync<'delay, DI, DELAY> {
     di: DI,
     delay: &'delay mut DELAY,
+}
+
+pub struct InitEngineItrAsync<DI> {
+    queue: heapless::Deque<QueuedInitCommand, 24>,
+    _di: PhantomData<DI>,
 }
 
 pub struct InitEngineAsync<DI> {
@@ -60,6 +65,18 @@ where
 
     pub fn release(self) -> DI {
         self.di
+    }
+}
+
+impl<DI> InitEngineItrAsync<DI>
+where
+    DI: InterfaceItrAsync,
+{
+    pub fn new(_di: &DI) -> Self {
+        Self {
+            queue: heapless::Deque::new(),
+            _di: PhantomData,
+        }
     }
 }
 
@@ -99,6 +116,39 @@ where
 
     fn pop_command(&mut self) -> Option<QueuedInitCommand> {
         None
+    }
+}
+
+impl<DI> InitEngine for InitEngineItrAsync<DI>
+where
+    DI: InterfaceItrAsync,
+{
+    const INTERFACE_KIND: InterfaceKind = DI::KIND;
+    type Error = ModelInitError<DI::Error>;
+
+    fn queue_command(&mut self, command: impl DcsCommand) -> Result<(), Self::Error> {
+        self.queue
+            .push_back(command.into())
+            .map_err(|_| ModelInitError::InitEngineQueueFull)
+    }
+
+    fn queue_command_raw(&mut self, command: u8, args: &[u8]) -> Result<(), Self::Error> {
+        let mut arg_buf = [0u8; 16];
+        arg_buf[..args.len()].copy_from_slice(args);
+
+        self.queue
+            .push_back(QueuedInitCommand::RawDcs(command, arg_buf))
+            .map_err(|_| ModelInitError::InitEngineQueueFull)
+    }
+
+    fn queue_delay_us(&mut self, us: u32) -> Result<(), Self::Error> {
+        self.queue
+            .push_back(QueuedInitCommand::Delay(us))
+            .map_err(|_| ModelInitError::InitEngineQueueFull)
+    }
+
+    fn pop_command(&mut self) -> Option<QueuedInitCommand> {
+        self.queue.pop_front()
     }
 }
 
