@@ -13,9 +13,11 @@ rust-version = "1.75"
 
 [dependencies]
 #embedded-graphics-core = "0.4.0"
-embedded-graphics-core = { path = "../embedded-graphics/core", features = [
+#embedded-graphics-core = { path = "../embedded-graphics/core", features = ["async_draw"] }
+embedded-graphics-core = { git = "https://github.com/TomDeRybel/embedded-graphics.git", features = [
     "async_draw",
 ] }
+
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
 heapless = "0.8.0"
