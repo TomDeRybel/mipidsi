@@ -189,6 +189,10 @@ where
         Ok(())
     }
 
+    async fn send_buffer(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        self.spi.write(buf).await.map_err(SpiError::Spi)
+    }
+
     async fn send_pixels<const N: usize>(
         &mut self,
         pixels: impl IntoIterator<Item = [Self::Word; N]>,

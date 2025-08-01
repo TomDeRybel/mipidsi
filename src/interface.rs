@@ -105,6 +105,10 @@ pub trait InterfaceItrAsync {
         pixel: [Self::Word; N],
         count: u32,
     ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Send framebuffer contents over to the device
+    /// TODO: should this be &[Self::Word] instead???
+    fn send_buffer(&mut self, buf: &[u8]) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
 /// Async version of command and framebuffer transfer interface

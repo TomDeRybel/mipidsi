@@ -327,6 +327,39 @@ where
         self.draw_batch(item).await
     }
 
+    // TODO: add batch mode? Then again, only makes sense if the buffers to draw
+    // are really tiny, which they aren't as much in our use case. We just want
+    // the pixels in the buffer out to the screen as fast as possible, and entirely
+    // handled by the DMA controller.
+    async fn draw_buf_raw_async(
+        &mut self,
+        area: &Rectangle,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        let intersection = area.intersection(&self.bounding_box());
+        let Some(bottom_right) = intersection.bottom_right() else {
+            // No intersection -> nothing to draw
+            return Ok(());
+        };
+
+        // Unchecked casting to u16 cannot fail here because the values are
+        // clamped to the display size which always fits in an u16.
+        let sx = intersection.top_left.x as u16;
+        let sy = intersection.top_left.y as u16;
+        let ex = bottom_right.x as u16;
+        let ey = bottom_right.y as u16;
+
+        // Send the data to the display if all edges are within the display area.
+        if &intersection == area {
+            // Set the drawing area in the display controller and send the pixels.
+            self.set_address_window(sx, sy, ex, ey).await?;
+            self.di.write_command(dcs::WriteMemoryStart).await?;
+            self.di.send_buffer(bytes).await
+        } else {
+            panic!("The draw area does not fit the display area.");
+        }
+    }
+
     async fn fill_contiguous_async<I>(
         &mut self,
         area: &Rectangle,
